@@ -1,0 +1,470 @@
+From 96f4936c24109003ac33435331cedf01e97b1dcd Mon Sep 17 00:00:00 2001
+From: Lucas <lucas@eliteaero.com.br>
+Date: Mon, 27 Apr 2026 22:33:43 +0200
+Subject: [PATCH 1/3] [Bugfix][Quantization] GGUF: sort merged-column slots by
+ index, not stream order
+
+Hit this loading a Qwen3.5 GatedDeltaNet GGUF where the file emits
+the linear-attn input projection slots in the order [Z, Q, K, V]
+(slot 3 first, then 0/1/2). The padded MergedColumn buffer ended up
+laid out in that stream order, and apply() concatenated the result
+back the same way, so the downstream layer received [Z, Q, K, V] when
+it expected [Q, K, V, Z]. Garbage-in for everything past that point.
+
+The bug is in _create_padded_weight_param: each slot's row offset is
+computed as sum(data_container[:id_in_container]), which is "rows of
+slots loaded before this one". That happens to match the canonical
+layout only when the GGUF file streams slots in declared order. Walk
+shard_id in slot-index order instead and accumulate the offset as we
+go. The QKV string-key path is unchanged.
+
+apply() needs the same change so the final concat keeps the declared
+slot order. Without it the offsets are right but the iteration order
+isn't.
+
+Backwards compatible: any GGUF that already streamed slots in order
+(every checkpoint we'd seen before) was already getting the canonical
+layout for free.
+
+Tests in tests/quantization/test_gguf_slot_ordering.py construct a
+2-slot MergedColumn fixture with reversed load order plus a shuffled
+q/k/v fixture and check that the buffer placement and the q/k/v
+ordering both come out canonical.
+
+Signed-off-by: Lucas <lucas@eliteaero.com.br>
+---
+ tests/quantization/test_gguf_slot_ordering.py | 157 ++++++++++++++++++
+ .../layers/quantization/gguf.py               |  50 +++++-
+ 2 files changed, 200 insertions(+), 7 deletions(-)
+ create mode 100644 tests/quantization/test_gguf_slot_ordering.py
+
+diff --git a/tests/quantization/test_gguf_slot_ordering.py b/tests/quantization/test_gguf_slot_ordering.py
+new file mode 100644
+index 000000000000..969d33948f02
+--- /dev/null
++++ b/tests/quantization/test_gguf_slot_ordering.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for GGUF MergedColumn slot-ordering.
++
++When a GGUF file emits merged-column slots out of declared order, the
++padded buffer used to be laid out in load order, so the concatenated
++output ended up shuffled (e.g. [Z, Q, K, V] instead of [Q, K, V, Z]).
++"""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.quantization.gguf import GGUFLinearMethod
++
++
++class _FakeQWeight(torch.nn.Parameter):
++    """Stand-in for GGUFUninitializedParameter with just the attrs that
++    _create_padded_weight_param reads."""
++
++    def __new__(cls):
++        return super().__new__(cls, torch.empty(0), requires_grad=False)
++
++
++class _FakeLayer:
++    def __init__(self, qweight):
++        self.qweight = qweight
++
++    def register_parameter(self, name, param):
++        setattr(self, name, param)
++
++
++def _make_layer(
++    shard_sizes: list[tuple[int, int]],
++    load_order: list[int],
++) -> _FakeLayer:
++    """``shard_sizes`` is in slot-index order; ``load_order`` is the order the
++    GGUF file emits the slots."""
++    data_container = []
++    shard_id_map: dict[int, int] = {}
++    # Fill each slot with a constant equal to the slot index so placement can
++    # be verified by reading the buffer back.
++    for pos, slot in enumerate(load_order):
++        rows, cols = shard_sizes[slot]
++        data_container.append(torch.full((rows, cols), float(slot)))
++        shard_id_map[slot] = pos
++
++    qweight = _FakeQWeight()
++    qweight.data_container = data_container
++    qweight.shard_id = list(load_order)
++    qweight.shard_id_map = shard_id_map
++    return _FakeLayer(qweight)
++
++
++def test_padded_weight_param_uses_canonical_slot_order():
++    """Slots loaded out of order should still land at index-ordered offsets."""
++    # Slot 0: 4 rows, slot 1: 6 rows. GGUF emits slot 1 first, then slot 0.
++    layer = _make_layer(
++        shard_sizes=[(4, 8), (6, 8)],
++        load_order=[1, 0],
++    )
++
++    GGUFLinearMethod._create_padded_weight_param(  # noqa: SLF001
++        GGUFLinearMethod.__new__(GGUFLinearMethod), layer
++    )
++
++    # Canonical layout: slot 0 occupies rows [0:4], slot 1 occupies rows [4:10].
++    assert layer.qweight.shard_offset_map[0] == (0, 4, 8)
++    assert layer.qweight.shard_offset_map[1] == (4, 10, 8)
++    # The actual buffer contents must reflect the canonical order too.
++    assert torch.all(layer.qweight.data[0:4] == 0.0)
++    assert torch.all(layer.qweight.data[4:10] == 1.0)
++
++
++def test_padded_weight_param_load_order_matches_canonical():
++    """Backward compatibility: canonical-order load behaves identically."""
++    layer = _make_layer(
++        shard_sizes=[(4, 8), (6, 8)],
++        load_order=[0, 1],
++    )
++
++    GGUFLinearMethod._create_padded_weight_param(  # noqa: SLF001
++        GGUFLinearMethod.__new__(GGUFLinearMethod), layer
++    )
++
++    assert layer.qweight.shard_offset_map[0] == (0, 4, 8)
++    assert layer.qweight.shard_offset_map[1] == (4, 10, 8)
++    assert torch.all(layer.qweight.data[0:4] == 0.0)
++    assert torch.all(layer.qweight.data[4:10] == 1.0)
++
++
++def test_qkv_string_keys_keep_qkv_order():
++    """q/k/v string keys keep the q,k,v layout regardless of stream order."""
++    data_container = [
++        torch.full((3, 8), 2.0),  # v
++        torch.full((3, 8), 0.0),  # q
++        torch.full((3, 8), 1.0),  # k
++    ]
++    qweight = _FakeQWeight()
++    qweight.data_container = data_container
++    qweight.shard_id = ["v", "q", "k"]
++    qweight.shard_id_map = {"v": 0, "q": 1, "k": 2}
++    layer = _FakeLayer(qweight)
++
++    GGUFLinearMethod._create_padded_weight_param(  # noqa: SLF001
++        GGUFLinearMethod.__new__(GGUFLinearMethod), layer
++    )
++
++    assert layer.qweight.shard_offset_map["q"] == (0, 3, 8)
++    assert layer.qweight.shard_offset_map["k"] == (3, 6, 8)
++    assert layer.qweight.shard_offset_map["v"] == (6, 9, 8)
++
++
++def test_apply_concatenates_slots_in_canonical_order(monkeypatch):
++    """The concatenated apply() output should keep the declared slot
++    order even if slots were loaded in stream order."""
++    # Build a layer with two slots loaded out of declared order, then run
++    # _create_padded_weight_param to materialize qweight.
++    layer = _make_layer(
++        shard_sizes=[(4, 8), (6, 8)],
++        load_order=[1, 0],
++    )
++    GGUFLinearMethod._create_padded_weight_param(  # noqa: SLF001
++        GGUFLinearMethod.__new__(GGUFLinearMethod), layer
++    )
++
++    # Stand-in qweight_type; apply() reads the per-slot type from this.
++    qweight_type = type(
++        "QT",
++        (),
++        {"shard_weight_type": {0: "T0", 1: "T1"}, "weight_type": "TX"},
++    )()
++    setattr(layer, "qweight_type", qweight_type)  # noqa: B010
++
++    # Stub the kernel; record which slot it was called for so we can
++    # assert the iteration order, and return a sentinel column-vector
++    # carrying the slot id.
++    calls: list[int] = []
++
++    def fake_kernel(x, _qweight, qweight_type):
++        slot = {"T0": 0, "T1": 1}[qweight_type]
++        calls.append(slot)
++        return torch.full((x.shape[0], 1), float(slot))
++
++    import vllm.model_executor.layers.quantization.gguf as gguf_mod
++
++    monkeypatch.setattr(gguf_mod, "fused_mul_mat_gguf", fake_kernel)
++
++    method = GGUFLinearMethod.__new__(GGUFLinearMethod)
++    out = method.apply(layer, torch.zeros(2, 8))
++
++    assert calls == [0, 1], f"apply() iterated slots in {calls}, expected [0, 1]"
++    # Concatenated [slot 0 col, slot 1 col] => [[0, 1], [0, 1]].
++    assert torch.equal(out, torch.tensor([[0.0, 1.0], [0.0, 1.0]]))
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])
+diff --git a/vllm/model_executor/layers/quantization/gguf.py b/vllm/model_executor/layers/quantization/gguf.py
+index 61eb6c912a11..87ddba39ae24 100644
+--- a/vllm/model_executor/layers/quantization/gguf.py
++++ b/vllm/model_executor/layers/quantization/gguf.py
+@@ -429,6 +429,31 @@ def _apply_gguf_embedding_fake(
+     raise error
+ 
+ 
++def _canonical_shard_order(shard_id):
++    """Return shard ids in the canonical layout order regardless of the order
++    they were loaded from the GGUF file.
++
++    The two slot-id schemes that reach this code are mutually exclusive:
++    QKVParallelLinear uses the strings q/k/v, MergedColumnParallelLinear uses
++    integers (0, 1, ...). Sorting the integers gives the declared slot order.
++    """
++    has_str = any(isinstance(s, str) for s in shard_id)
++    has_int = any(isinstance(s, int) for s in shard_id)
++    assert not (has_str and has_int), (
++        f"shard_id {shard_id} mixes string and integer slot ids; "
++        "QKV (q/k/v) and MergedColumn (int) schemes must not be combined."
++    )
++    if has_str:
++        canonical = [s for s in ("q", "k", "v") if s in shard_id]
++    else:
++        canonical = sorted(shard_id)
++    assert len(canonical) == len(shard_id), (
++        f"shard_id {shard_id} contains slot ids outside the canonical set; "
++        f"got {canonical} after canonicalization."
++    )
++    return canonical
++
++
+ class GGUFLinearMethod(LinearMethodBase):
+     """Linear method for GGUF.
+ 
+@@ -517,13 +542,22 @@ def _create_padded_weight_param(self, layer: torch.nn.Module):
+             )
+             # (dim0_start, dim0_end, dim1_size)
+             shard_offset_map = dict[str, tuple[int, int, int]]()
+-            for idx in shard_id:
++            # Place each slot at the offset its declared index implies, not
++            # the offset its position in the GGUF stream implies. The old
++            # code summed sizes of data_container[:id_in_container], which
++            # is stream order; that's wrong whenever the GGUF file emits
++            # slots out of declared order (we hit this with slot 3 before
++            # slots 0/1/2 on a Qwen3.5 GDN attn_qkv).
++            cur = 0
++            for idx in _canonical_shard_order(shard_id):
+                 id_in_container = shard_id_map[idx]
+-                start = sum(x.size(0) for x in data_container[:id_in_container])
+-                end = start + data_container[id_in_container].size(0)
+-                size = data_container[id_in_container].size(1)
+-                padded_data[start:end, :size] = data_container[id_in_container]
++                shard = data_container[id_in_container]
++                start = cur
++                end = cur + shard.size(0)
++                size = shard.size(1)
++                padded_data[start:end, :size] = shard
+                 shard_offset_map[idx] = (start, end, size)
++                cur = end
+             qweight.data_container.clear()
+             padded_param = Parameter(padded_data, requires_grad=False)
+             set_weight_attrs(padded_param, vars(qweight))
+@@ -539,8 +573,10 @@ def apply(
+         shard_id = layer.qweight.shard_id
+ 
+         if shard_id:
+-            # dequantize shard weights respectively
+-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
++            # Match the layout that _create_padded_weight_param produced so
++            # the concatenated output keeps the slot order the layer
++            # declared, not whatever order the GGUF file streamed.
++            shard_id = _canonical_shard_order(shard_id)
+             qweight = layer.qweight
+             result = []
+             for idx in shard_id:
+
+From f66bd96dfe89a813e2d047b87dbac36ede86753a Mon Sep 17 00:00:00 2001
+From: Lucas <lucas@eliteaero.com.br>
+Date: Tue, 28 Apr 2026 01:12:32 +0200
+Subject: [PATCH 2/3] [Bugfix][Quantization] GGUF: cache canonical shard order
+ on param to avoid per-forward sorting
+
+Move _canonical_shard_order into GGUFLinearMethod as a @staticmethod.
+Compute the canonical order once in _create_padded_weight_param and store
+it as canonical_shard_id on the padded parameter via set_weight_attrs.
+The apply() path reads that cached list directly instead of re-sorting
+shard_id on every forward pass.
+
+Fix the QKV assert message to name the valid set explicitly.
+Extend the test to assert canonical_shard_id is set on the param.
+
+Signed-off-by: Lucas <lucas@eliteaero.com.br>
+---
+ tests/quantization/test_gguf_slot_ordering.py |  4 ++
+ .../layers/quantization/gguf.py               | 64 +++++++++----------
+ 2 files changed, 36 insertions(+), 32 deletions(-)
+
+diff --git a/tests/quantization/test_gguf_slot_ordering.py b/tests/quantization/test_gguf_slot_ordering.py
+index 969d33948f02..e095aab19000 100644
+--- a/tests/quantization/test_gguf_slot_ordering.py
++++ b/tests/quantization/test_gguf_slot_ordering.py
+@@ -69,6 +69,9 @@ def test_padded_weight_param_uses_canonical_slot_order():
+     # The actual buffer contents must reflect the canonical order too.
+     assert torch.all(layer.qweight.data[0:4] == 0.0)
+     assert torch.all(layer.qweight.data[4:10] == 1.0)
++    # The canonical iteration order is cached on the param so apply() can
++    # iterate without re-sorting on every forward pass.
++    assert layer.qweight.canonical_shard_id == [0, 1]
+ 
+ 
+ def test_padded_weight_param_load_order_matches_canonical():
+@@ -108,6 +111,7 @@ def test_qkv_string_keys_keep_qkv_order():
+     assert layer.qweight.shard_offset_map["q"] == (0, 3, 8)
+     assert layer.qweight.shard_offset_map["k"] == (3, 6, 8)
+     assert layer.qweight.shard_offset_map["v"] == (6, 9, 8)
++    assert layer.qweight.canonical_shard_id == ["q", "k", "v"]
+ 
+ 
+ def test_apply_concatenates_slots_in_canonical_order(monkeypatch):
+diff --git a/vllm/model_executor/layers/quantization/gguf.py b/vllm/model_executor/layers/quantization/gguf.py
+index 87ddba39ae24..1198a1011af3 100644
+--- a/vllm/model_executor/layers/quantization/gguf.py
++++ b/vllm/model_executor/layers/quantization/gguf.py
+@@ -429,31 +429,6 @@ def _apply_gguf_embedding_fake(
+     raise error
+ 
+ 
+-def _canonical_shard_order(shard_id):
+-    """Return shard ids in the canonical layout order regardless of the order
+-    they were loaded from the GGUF file.
+-
+-    The two slot-id schemes that reach this code are mutually exclusive:
+-    QKVParallelLinear uses the strings q/k/v, MergedColumnParallelLinear uses
+-    integers (0, 1, ...). Sorting the integers gives the declared slot order.
+-    """
+-    has_str = any(isinstance(s, str) for s in shard_id)
+-    has_int = any(isinstance(s, int) for s in shard_id)
+-    assert not (has_str and has_int), (
+-        f"shard_id {shard_id} mixes string and integer slot ids; "
+-        "QKV (q/k/v) and MergedColumn (int) schemes must not be combined."
+-    )
+-    if has_str:
+-        canonical = [s for s in ("q", "k", "v") if s in shard_id]
+-    else:
+-        canonical = sorted(shard_id)
+-    assert len(canonical) == len(shard_id), (
+-        f"shard_id {shard_id} contains slot ids outside the canonical set; "
+-        f"got {canonical} after canonicalization."
+-    )
+-    return canonical
+-
+-
+ class GGUFLinearMethod(LinearMethodBase):
+     """Linear method for GGUF.
+ 
+@@ -464,6 +439,24 @@ class GGUFLinearMethod(LinearMethodBase):
+     def __init__(self, quant_config: GGUFConfig):
+         self.quant_config = quant_config
+ 
++    @staticmethod
++    def _canonical_shard_order(shard_id: list) -> list:
++        # Return shard ids in declared layout order, regardless of GGUF stream order.
++        has_str = any(isinstance(s, str) for s in shard_id)
++        has_int = any(isinstance(s, int) for s in shard_id)
++        assert not (has_str and has_int), (
++            f"shard_id {shard_id} mixes string and integer slot ids; "
++            "QKV (q/k/v) and MergedColumn (int) schemes must not be combined."
++        )
++        if has_str:
++            canonical = [s for s in ("q", "k", "v") if s in shard_id]
++            assert len(canonical) == len(shard_id), (
++                f"shard_id {shard_id} contains keys outside {{'q', 'k', 'v'}}."
++            )
++        else:
++            canonical = sorted(shard_id)
++        return canonical
++
+     def create_weights(
+         self,
+         layer: torch.nn.Module,
+@@ -549,7 +542,8 @@ def _create_padded_weight_param(self, layer: torch.nn.Module):
+             # slots out of declared order (we hit this with slot 3 before
+             # slots 0/1/2 on a Qwen3.5 GDN attn_qkv).
+             cur = 0
+-            for idx in _canonical_shard_order(shard_id):
++            canonical_shard_id = GGUFLinearMethod._canonical_shard_order(shard_id)
++            for idx in canonical_shard_id:
+                 id_in_container = shard_id_map[idx]
+                 shard = data_container[id_in_container]
+                 start = cur
+@@ -561,7 +555,13 @@ def _create_padded_weight_param(self, layer: torch.nn.Module):
+             qweight.data_container.clear()
+             padded_param = Parameter(padded_data, requires_grad=False)
+             set_weight_attrs(padded_param, vars(qweight))
+-            set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
++            set_weight_attrs(
++                padded_param,
++                {
++                    "shard_offset_map": shard_offset_map,
++                    "canonical_shard_id": canonical_shard_id,
++                },
++            )
+             layer.register_parameter("qweight", padded_param)
+ 
+     def apply(
+@@ -573,13 +573,13 @@ def apply(
+         shard_id = layer.qweight.shard_id
+ 
+         if shard_id:
+-            # Match the layout that _create_padded_weight_param produced so
+-            # the concatenated output keeps the slot order the layer
+-            # declared, not whatever order the GGUF file streamed.
+-            shard_id = _canonical_shard_order(shard_id)
++            # Iterate in canonical (declared) slot order, matching the
++            # layout _create_padded_weight_param produced. The order is
++            # computed once at load time and stashed on the param so the
++            # forward path stays free of per-call sorting.
+             qweight = layer.qweight
+             result = []
+-            for idx in shard_id:
++            for idx in qweight.canonical_shard_id:
+                 start, end, offset = layer.qweight.shard_offset_map[idx]
+                 qweight_type = layer.qweight_type.shard_weight_type[idx]
+                 result.append(
+
+From 2d266f24653dffecfc95c7384cfa7760766a72ae Mon Sep 17 00:00:00 2001
+From: Lucas <lucas@eliteaero.com.br>
+Date: Tue, 28 Apr 2026 12:38:36 +0200
+Subject: [PATCH 3/3] Fix assert pattern and add TP>1 guard comment in
+ _create_padded_weight_param
+
+Replace `assert ..., ValueError(...)` (which raises AssertionError with a
+ValueError *object* as its message) with a proper `if ... raise ValueError(...)`.
+
+Add comment on the `> 1` guard explaining that single-slot layers need no
+merge and that shard_offset_map is absent for them (relevant for TP>1 where
+only one slot may land on a given rank).
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+
+Signed-off-by: Lucas <lucas@eliteaero.com.br>
+---
+ vllm/model_executor/layers/quantization/gguf.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/model_executor/layers/quantization/gguf.py b/vllm/model_executor/layers/quantization/gguf.py
+index 1198a1011af3..ea20450e9643 100644
+--- a/vllm/model_executor/layers/quantization/gguf.py
++++ b/vllm/model_executor/layers/quantization/gguf.py
+@@ -519,11 +519,12 @@ def _create_padded_weight_param(self, layer: torch.nn.Module):
+         qweight = layer.qweight
+         shard_id_map = qweight.shard_id_map
+         shard_id = qweight.shard_id
++        # Skip single-slot layers: no merge needed, and shard_offset_map is
++        # not built for them (TP>1 may land only one slot on this rank).
+         if len(data_container := qweight.data_container) > 1:
+             dtype = {data.dtype for data in data_container}
+-            assert len(dtype) == 1, ValueError(
+-                f"Data container has mixed dtypes: {dtype}"
+-            )
++            if len(dtype) != 1:
++                raise ValueError(f"Data container has mixed dtypes: {dtype}")
+             dtype = next(iter(dtype))
+             # concat dim0 and pad dim1
+             padded_side = max(x.size(1) for x in data_container)

@@ -1,0 +1,93 @@
+From 89c916becb55ade7556e08f21fe282c799e23092 Mon Sep 17 00:00:00 2001
+From: Li <chuali@amd.com>
+Date: Sun, 22 Mar 2026 02:00:10 -0700
+Subject: [PATCH] [Model] Add GGUF support for Qwen3.5 hybrid models
+
+Add GGUF loading support for Qwen3.5 (dense) and Qwen3.5-MoE hybrid
+Mamba/Attention models by bridging the HF model_type to gguf-py
+architecture names.
+
+Key changes:
+- Map qwen3_5_text -> qwen35 and qwen3_5_moe_text -> qwen35moe in the
+  GGUF weight mapper
+- Add manual GGUF-to-HF tensor mappings for bare nn.Parameter tensors
+  (A_log, dt_bias) that lack .weight/.bias suffixes and have naming
+  mismatches (dt_proj vs dt_bias) between gguf-py and HF
+- Add merged expert weight mappings for the MoE variant, following the
+  same pattern as existing qwen3_moe support
+- Add GGUF test configuration for Qwen3.5-0.8B (commented out pending
+  GDN attention runtime validation)
+
+Made-with: Cursor
+---
+ tests/models/quantization/test_gguf.py        |  7 +++++
+ .../model_loader/gguf_loader.py               | 31 +++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/tests/models/quantization/test_gguf.py b/tests/models/quantization/test_gguf.py
+index 064ca94f3cba..eadf17d036ca 100644
+--- a/tests/models/quantization/test_gguf.py
++++ b/tests/models/quantization/test_gguf.py
+@@ -90,6 +90,12 @@ def gguf_model(self):
+     gguf_filename="gemma-3-270m-it-qat-Q4_0.gguf",
+ )
+ 
++QWEN3_5_CONFIG = GGUFTestConfig(
++    original_model="Qwen/Qwen3.5-0.8B",
++    gguf_repo="ddh0/Qwen3.5-GGUF",
++    gguf_filename="Qwen3.5-0.8B-9.71bpw.gguf",
++)
++
+ MODELS = [
+     # LLAMA_CONFIG, # broken: https://github.com/vllm-project/vllm/issues/19458
+     QWEN2_CONFIG,
+@@ -100,6 +106,7 @@ def gguf_model(self):
+     DOLPHIN_CONFIG,
+     GEMMA3_CONFIG,
+     # STARCODER_CONFIG, # broken
++    # QWEN3_5_CONFIG, # hybrid Mamba/Attention model, needs GDN attention support
+ ]
+ 
+ 
+diff --git a/vllm/model_executor/model_loader/gguf_loader.py b/vllm/model_executor/model_loader/gguf_loader.py
+index 25fa3ba03f08..235d17ccac2b 100644
+--- a/vllm/model_executor/model_loader/gguf_loader.py
++++ b/vllm/model_executor/model_loader/gguf_loader.py
+@@ -141,6 +141,37 @@ def _get_gguf_weights_map(self, model_config: ModelConfig):
+                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                     )
+                 )
++        if model_type in ("qwen3_5_text", "qwen3_5_moe_text"):
++            is_moe = model_type == "qwen3_5_moe_text"
++            model_type = "qwen35moe" if is_moe else "qwen35"
++            # Qwen3.5 hybrid models have bare nn.Parameter tensors (A_log,
++            # dt_bias) that lack .weight/.bias suffixes in HF state_dict.
++            # Additionally, the gguf tensor map uses "dt_proj" while HF uses
++            # "dt_bias". Both issues require manual GGUF-to-HF mapping.
++            for idx in range(text_config.num_hidden_layers):
++                gguf_to_hf_name_map[f"blk.{idx}.ssm_a.weight"] = (
++                    f"model.layers.{idx}.linear_attn.A_log"
++                )
++                gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.weight"] = (
++                    f"model.layers.{idx}.linear_attn.dt_bias"
++                )
++            if is_moe:
++                for idx in range(text_config.num_hidden_layers):
++                    gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
++                        f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
++                    )
++                    gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
++                        f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
++                    )
++                    gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
++                        f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
++                    )
++                    sideload_params.append(
++                        re.compile(
++                            f"model\\.layers\\.{idx}"
++                            r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
++                        )
++                    )
+ 
+         arch = None
+         for key, value in gguf.MODEL_ARCH_NAMES.items():

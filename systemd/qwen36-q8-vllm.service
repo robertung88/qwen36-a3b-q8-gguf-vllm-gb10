@@ -1,0 +1,42 @@
+[Unit]
+Description=VLLM Qwen3.6 35B-A3B Q8 GGUF
+After=network.target docker.service
+Requires=docker.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=%i
+ExecStartPre=-/usr/bin/docker rm -f vllm-qwen36-q8
+ExecStart=/usr/bin/docker run \
+  --name vllm-qwen36-q8 \
+  --restart no \
+  --gpus all \
+  -v /home/%i/models:/models \
+  -p 8000:8000 \
+  --shm-size=16g \
+  qwen36-a3b-q8-gguf-vllm-gb10:latest \
+  vllm serve /models/qwen36-35b-a3b-mtp-gguf-ud-q8-k-xl/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf \
+  --served-model-name qwen36-35b-a3b-q8 \
+  --host 0.0.0.0 --port 8000 --tensor-parallel-size 1 \
+  --dtype float16 --load-format gguf --quantization gguf \
+  --hf-config-path /models/qwen36-35b-a3b-mtp-gguf-ud-q8-k-xl \
+  --tokenizer /models/qwen36-35b-a3b-mtp-gguf-ud-q8-k-xl \
+  --max-model-len 262144 --attention-backend flash_attn \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs "{\"enable_thinking\":false}" \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --limit-mm-per-prompt "{\"image\":1,\"video\":0}" \
+  --skip-mm-profiling --mm-encoder-tp-mode data \
+  --generation-config vllm --gpu-memory-utilization 0.82 \
+  --max-num-batched-tokens 2048 --max-num-seqs 6 \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --enforce-eager --trust-remote-code \
+  --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":2}"
+ExecStop=/usr/bin/docker stop vllm-qwen36-q8
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

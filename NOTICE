@@ -1,0 +1,5 @@
+This repository contains modified portions of VLLM source files, which are
+licensed under the Apache License 2.0 by the VLLM project contributors.
+
+Model weights are not included. Users must obtain model files from their
+respective Hugging Face repositories and comply with their licenses.

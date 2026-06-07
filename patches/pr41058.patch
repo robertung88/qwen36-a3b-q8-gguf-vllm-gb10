@@ -1,0 +1,448 @@
+From 7b41cc9992a4406ee1a1570265ed2eb90fd2a800 Mon Sep 17 00:00:00 2001
+From: Lucas <lucas@eliteaero.com.br>
+Date: Mon, 27 Apr 2026 22:37:57 +0200
+Subject: [PATCH 1/2] [Bugfix][Core] linear: support tuple shard_id for fused
+ multi-slot GGUF tensors
+
+GGUF can pack multiple framework slots into one on-disk tensor. Hit
+this loading a Qwen3.5 GatedDeltaNet checkpoint where the linear-attn
+input projection ships as a single attn_qkv tensor (slots 0/1/2 fused)
+plus a separate attn_gate tensor (slot 3). The loader called the
+existing weight_loader with loaded_shard_id=(0, 1, 2) and got back:
+
+    NotImplementedError: Shard id with multiple indices is not
+    supported for GGUF.
+
+Replace the raise with a small split-and-recurse: walk the slot ids,
+narrow loaded_weight along output_dim by per-slot output_sizes, and
+call back into weight_loader with single ints. The rest of the GGUF
+path (data_container, shard_id_map, dequant) sees plain per-slot
+shards and behaves the same as before. The matching is_gguf_weight_type
+scalar is broadcast to each slot via the same recursion. Non-tuple
+calls go down exactly the same code path they used to, so no perf
+impact on the common case.
+
+Also fixes a 1-D vs 2-D mismatch in ReplicatedLinear.weight_loader.
+GGUF stores a single-output nn.Linear weight (e.g. an MoE
+shared_expert_gate of shape [1, hidden]) as a 1-D tensor of length
+hidden; the loader now adds the leading 1 when the parameter has
+exactly that extra unit dim, matching the materialized shape.
+
+tests/model_executor/layers/test_linear_gguf_tuple_shard.py covers
+the fused-weight split, the weight-type scalar broadcast, the
+size-mismatch assertion, and the replicated-linear unsqueeze.
+
+Signed-off-by: Lucas <lucas@eliteaero.com.br>
+---
+ .../layers/test_linear_gguf_tuple_shard.py    | 188 ++++++++++++++++++
+ vllm/model_executor/layers/linear.py          |  54 ++++-
+ 2 files changed, 240 insertions(+), 2 deletions(-)
+ create mode 100644 tests/model_executor/layers/test_linear_gguf_tuple_shard.py
+
+diff --git a/tests/model_executor/layers/test_linear_gguf_tuple_shard.py b/tests/model_executor/layers/test_linear_gguf_tuple_shard.py
+new file mode 100644
+index 000000000000..e02838f3d2c0
+--- /dev/null
++++ b/tests/model_executor/layers/test_linear_gguf_tuple_shard.py
+@@ -0,0 +1,188 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for tuple shard_id support on the GGUF weight-loading path.
++
++GGUF files sometimes pack several output slots into one on-disk tensor
++(e.g. Qwen3.5 GDN's attn_qkv carries Q, K and V together). The loader
++used to refuse such tensors with NotImplementedError. These tests check
++that it now splits the fused tensor along output_dim and recurses with
++single-int shard ids.
++
++Also covers the ReplicatedLinear [N] -> [1, N] shape gap that bites
++single-output linears like the MoE shared_expert_gate.
++"""
++
++import types
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.linear import (
++    MergedColumnParallelLinear,
++    ReplicatedLinear,
++)
++
++
++class _FakeQWeight(torch.nn.Parameter):
++    """Stand-in for a GGUFUninitializedParameter with just the attrs that
++    the GGUF branch of weight_loader reads."""
++
++    def __new__(cls):
++        return super().__new__(cls, torch.empty(0), requires_grad=False)
++
++
++def _make_fake_self(
++    output_sizes: list[int], tp_size: int = 1, tp_rank: int = 0
++) -> SimpleNamespace:
++    fake_self = SimpleNamespace(
++        output_sizes=output_sizes, tp_size=tp_size, tp_rank=tp_rank
++    )
++    fake_self.validate_shard_id = types.MethodType(
++        MergedColumnParallelLinear.validate_shard_id, fake_self
++    )
++    fake_self.weight_loader = types.MethodType(
++        MergedColumnParallelLinear.weight_loader, fake_self
++    )
++    return fake_self
++
++
++def _make_gguf_qweight() -> _FakeQWeight:
++    p = _FakeQWeight()
++    p.is_gguf_weight = True
++    p.output_dim = 0
++    p.data_container = []
++    p.shard_id = []
++    p.shard_id_map = {}
++    return p
++
++
++def _make_gguf_qweight_type(num_slots: int) -> _FakeQWeight:
++    p = _FakeQWeight()
++    p.is_gguf_weight_type = True
++    p.shard_weight_type = {}
++    # ``param.data[idx].copy_(scalar)`` requires a buffer of length num_slots.
++    p.data = torch.zeros(num_slots, dtype=torch.uint8)
++    return p
++
++
++def test_tuple_shard_splits_fused_gguf_weight_into_slots():
++    """A fused GGUF tensor with loaded_shard_id=(0, 1, 2) should land as
++    three per-slot entries in data_container."""
++    output_sizes = [4, 6, 8]
++    fused = torch.cat(
++        [torch.full((size, 16), float(slot)) for slot, size in enumerate(output_sizes)],
++        dim=0,
++    )
++    fake_self = _make_fake_self(output_sizes)
++    param = _make_gguf_qweight()
++
++    MergedColumnParallelLinear.weight_loader(fake_self, param, fused, (0, 1, 2))
++
++    assert len(param.data_container) == 3
++    assert param.shard_id == [0, 1, 2]
++    assert param.shard_id_map == {0: 0, 1: 1, 2: 2}
++    for slot, size in enumerate(output_sizes):
++        slot_tensor = param.data_container[param.shard_id_map[slot]]
++        assert slot_tensor.shape == (size, 16)
++        assert torch.all(slot_tensor == float(slot))
++
++
++def test_tuple_shard_propagates_weight_type_scalar_to_each_slot():
++    """is_gguf_weight_type tensors carry one scalar shared by every slot;
++    the recursion should store it under each slot."""
++    output_sizes = [4, 6]
++    weight_type_scalar = torch.tensor(42, dtype=torch.uint8)
++    fake_self = _make_fake_self(output_sizes)
++    param = _make_gguf_qweight_type(num_slots=len(output_sizes))
++
++    MergedColumnParallelLinear.weight_loader(
++        fake_self, param, weight_type_scalar, (0, 1)
++    )
++
++    assert param.shard_weight_type == {0: 42, 1: 42}
++
++
++def test_tuple_shard_assert_catches_size_mismatch():
++    """If the fused tensor's output-dim size doesn't match
++    sum(output_sizes[loaded_shard_id]) the loader should raise."""
++    output_sizes = [4, 6, 8]
++    fused = torch.zeros(17, 16)  # 17 != 4+6+8
++    fake_self = _make_fake_self(output_sizes)
++    param = _make_gguf_qweight()
++
++    with pytest.raises(AssertionError, match="Fused GGUF weight"):
++        MergedColumnParallelLinear.weight_loader(fake_self, param, fused, (0, 1, 2))
++
++
++def test_tuple_shard_per_slot_tp_sharding():
++    """Each slot's narrow() should run with its own size after the split,
++    so a TP=2 rank=1 load lands the second half of every slot."""
++    output_sizes = [4, 6]
++    fused = torch.cat(
++        [
++            torch.arange(size * 16, dtype=torch.float32).reshape(size, 16) + 100 * slot
++            for slot, size in enumerate(output_sizes)
++        ],
++        dim=0,
++    )
++    fake_self = _make_fake_self(output_sizes, tp_size=2, tp_rank=1)
++    param = _make_gguf_qweight()
++
++    MergedColumnParallelLinear.weight_loader(fake_self, param, fused, (0, 1))
++
++    # Each slot should have been narrowed to its second half along output_dim.
++    assert len(param.data_container) == 2
++    for slot, full_size in enumerate(output_sizes):
++        per_rank = full_size // 2
++        slot_tensor = param.data_container[param.shard_id_map[slot]]
++        assert slot_tensor.shape == (per_rank, 16), (
++            f"slot {slot}: got shape {slot_tensor.shape}, expected {(per_rank, 16)}"
++        )
++        # rank 1 took the second half of slot's portion of the fused tensor
++        slot_start = sum(output_sizes[:slot])
++        expected = fused.narrow(0, slot_start + per_rank, per_rank)
++        assert torch.equal(slot_tensor, expected)
++
++
++def test_tuple_shard_rejects_indivisible_slot_under_tp():
++    """A slot whose output_size isn't divisible by tp_size should be
++    flagged before silent narrow() truncation kicks in."""
++    output_sizes = [3, 6]  # slot 0 not divisible by 2
++    fused = torch.zeros(9, 16)
++    fake_self = _make_fake_self(output_sizes, tp_size=2, tp_rank=0)
++    param = _make_gguf_qweight()
++
++    with pytest.raises(AssertionError, match="not divisible by tp_size"):
++        MergedColumnParallelLinear.weight_loader(fake_self, param, fused, (0, 1))
++
++
++def test_replicated_linear_unsqueezes_1d_gguf_weight_for_single_output():
++    """A 1-D GGUF tensor of length hidden should land in a [1, hidden]
++    parameter (e.g. shared_expert_gate)."""
++    hidden = 32
++    param = torch.nn.Parameter(torch.zeros(1, hidden), requires_grad=False)
++    param.is_gguf_weight = True
++    loaded_weight = torch.arange(hidden, dtype=torch.float32)
++    fake_self = SimpleNamespace()  # weight_loader uses no instance state.
++
++    ReplicatedLinear.weight_loader(fake_self, param, loaded_weight)
++
++    assert param.shape == (1, hidden)
++    assert torch.equal(param.data.flatten(), loaded_weight)
++
++
++def test_replicated_linear_does_not_unsqueeze_non_gguf_weight():
++    """The unsqueeze fix should be GGUF-only — non-GGUF callers with a
++    1-D vs 2-D mismatch should still trip the assert."""
++    hidden = 8
++    param = torch.nn.Parameter(torch.zeros(1, hidden), requires_grad=False)
++    loaded_weight = torch.arange(hidden, dtype=torch.float32)
++    fake_self = SimpleNamespace()
++
++    with pytest.raises(AssertionError):
++        ReplicatedLinear.weight_loader(fake_self, param, loaded_weight)
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 6a4c1f3c47ef..c1544aab32e4 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -378,6 +378,20 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+         if len(loaded_weight.shape) == 0:
+             loaded_weight = loaded_weight.reshape(1)
+ 
++        # GGUF stores a single-output nn.Linear weight (e.g. an MoE
++        # shared_expert_gate of shape [1, hidden]) as a 1-D tensor of
++        # length hidden. Add the leading 1 so the shapes match.
++        # Gated on is_gguf_weight: HF safetensors store these as 2-D, so
++        # any non-GGUF caller hitting a 1-D vs [1, hidden] mismatch is a
++        # real bug and should still fall through to the assert below.
++        if (
++            is_gguf_weight
++            and param.dim() == loaded_weight.dim() + 1
++            and param.size(0) == 1
++            and param.shape[1:] == loaded_weight.shape
++        ):
++            loaded_weight = loaded_weight.unsqueeze(0)
++
+         assert param.size() == loaded_weight.size(), (
+             f"Tried to load weights of size {loaded_weight.size()}"
+             f"to a parameter of size {param.size()}"
+@@ -705,9 +719,45 @@ def weight_loader(
+         if isinstance(loaded_shard_id, tuple) and (
+             is_gguf_weight or is_gguf_weight_type
+         ):
+-            raise NotImplementedError(
+-                "Shard id with multiple indices is not supported for GGUF."
++            # GGUF can pack what the framework loads as separate slots into
++            # a single on-disk tensor (we hit this with Qwen3.5 GDN's
++            # attn_qkv carrying Q/K/V together). The fused tensor already
++            # concatenates the listed slots, so split it along output_dim
++            # by per-slot output_sizes and recurse with single-int ids.
++            # That way the rest of the GGUF path (data_container,
++            # shard_id_map, dequant) sees ordinary per-slot shards.
++            if is_gguf_weight_type:
++                # One weight-type scalar covers every slot of the fused
++                # tensor; just recurse with the same scalar per slot.
++                for slot in loaded_shard_id:
++                    self.weight_loader(param, loaded_weight, slot)
++                return
++            output_dim = getattr(param, "output_dim", None)
++            assert output_dim is not None, (
++                "GGUF fused tuple-shard requires param.output_dim to be set."
++            )
++            slot_sizes = [self.output_sizes[i] for i in loaded_shard_id]
++            assert sum(slot_sizes) == loaded_weight.size(output_dim), (
++                f"Fused GGUF weight along dim {output_dim} has size "
++                f"{loaded_weight.size(output_dim)} but slots "
++                f"{loaded_shard_id} sum to {sum(slot_sizes)}."
+             )
++            # Each slot is independently TP-sharded by the recursive call's
++            # is_gguf_weight branch, so its size has to be divisible by
++            # tp_size. Catching it here gives a clear message instead of a
++            # silent narrow() truncation later.
++            if self.tp_size > 1:
++                for slot, size in zip(loaded_shard_id, slot_sizes):
++                    assert size % self.tp_size == 0, (
++                        f"GGUF fused slot {slot} has output size {size} "
++                        f"which is not divisible by tp_size {self.tp_size}."
++                    )
++            offset = 0
++            for slot, size in zip(loaded_shard_id, slot_sizes):
++                slice_ = loaded_weight.narrow(output_dim, offset, size)
++                self.weight_loader(param, slice_, slot)
++                offset += size
++            return
+         if is_gguf_weight_type:
+             if loaded_shard_id is not None:
+                 param.data[loaded_shard_id].copy_(loaded_weight)
+
+From bbc3ca6db2b99c36d1572e45d81de16ba726613f Mon Sep 17 00:00:00 2001
+From: Lucas <lucas@eliteaero.com.br>
+Date: Tue, 28 Apr 2026 01:12:10 +0200
+Subject: [PATCH 2/2] [Bugfix][Core] linear: support tuple shard_id for fused
+ multi-slot GGUF tensors
+
+Add handling in MergedColumnParallelLinear.weight_loader for the case where
+loaded_shard_id is a tuple. GGUF can store what the framework treats as
+separate slots (e.g. Q/K/V) as a single fused on-disk tensor. The fix splits
+the fused weight along output_dim by per-slot output_sizes and recurses with
+each scalar slot id, so the existing GGUF dequant path sees ordinary shards.
+
+Also fix ReplicatedLinear: GGUF omits the leading 1 on single-output weights
+(e.g. shared_expert_gate, shape [1, hidden] stored as [hidden]). The unsqueeze
+must happen before param.materialize() so UninitializedParameter locks into
+[1, hidden], not [hidden]. Add a test covering the UninitializedParameter path.
+
+Signed-off-by: Lucas <lucas@eliteaero.com.br>
+---
+ .../layers/test_linear_gguf_tuple_shard.py    | 21 ++++++++-
+ vllm/model_executor/layers/linear.py          | 43 +++++--------------
+ 2 files changed, 30 insertions(+), 34 deletions(-)
+
+diff --git a/tests/model_executor/layers/test_linear_gguf_tuple_shard.py b/tests/model_executor/layers/test_linear_gguf_tuple_shard.py
+index e02838f3d2c0..e85ce9981a7a 100644
+--- a/tests/model_executor/layers/test_linear_gguf_tuple_shard.py
++++ b/tests/model_executor/layers/test_linear_gguf_tuple_shard.py
+@@ -164,7 +164,24 @@ def test_replicated_linear_unsqueezes_1d_gguf_weight_for_single_output():
+     param = torch.nn.Parameter(torch.zeros(1, hidden), requires_grad=False)
+     param.is_gguf_weight = True
+     loaded_weight = torch.arange(hidden, dtype=torch.float32)
+-    fake_self = SimpleNamespace()  # weight_loader uses no instance state.
++    fake_self = SimpleNamespace(output_size=1, input_size=hidden)
++
++    ReplicatedLinear.weight_loader(fake_self, param, loaded_weight)
++
++    assert param.shape == (1, hidden)
++    assert torch.equal(param.data.flatten(), loaded_weight)
++
++
++def test_replicated_linear_unsqueezes_before_materialize():
++    """An UninitializedParameter must end up at [1, hidden], not [hidden].
++    Reshaping after materialize would leave it 1-D forever."""
++    from torch.nn.parameter import UninitializedParameter
++
++    hidden = 16
++    param = UninitializedParameter()
++    param.is_gguf_weight = True
++    loaded_weight = torch.arange(hidden, dtype=torch.float32)
++    fake_self = SimpleNamespace(output_size=1, input_size=hidden)
+ 
+     ReplicatedLinear.weight_loader(fake_self, param, loaded_weight)
+ 
+@@ -178,7 +195,7 @@ def test_replicated_linear_does_not_unsqueeze_non_gguf_weight():
+     hidden = 8
+     param = torch.nn.Parameter(torch.zeros(1, hidden), requires_grad=False)
+     loaded_weight = torch.arange(hidden, dtype=torch.float32)
+-    fake_self = SimpleNamespace()
++    fake_self = SimpleNamespace(output_size=1, input_size=hidden)
+ 
+     with pytest.raises(AssertionError):
+         ReplicatedLinear.weight_loader(fake_self, param, loaded_weight)
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index c1544aab32e4..f52ed43db23a 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -371,27 +371,23 @@ def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+         if is_gguf_weight_type:
+             param.weight_type = loaded_weight.item()
+ 
+-        # Materialize GGUF UninitializedParameter
+-        if is_gguf_weight and isinstance(param, UninitializedParameter):
+-            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+-
+         if len(loaded_weight.shape) == 0:
+             loaded_weight = loaded_weight.reshape(1)
+ 
+-        # GGUF stores a single-output nn.Linear weight (e.g. an MoE
+-        # shared_expert_gate of shape [1, hidden]) as a 1-D tensor of
+-        # length hidden. Add the leading 1 so the shapes match.
+-        # Gated on is_gguf_weight: HF safetensors store these as 2-D, so
+-        # any non-GGUF caller hitting a 1-D vs [1, hidden] mismatch is a
+-        # real bug and should still fall through to the assert below.
++        # GGUF omits the leading 1 on single-output weights; unsqueeze before
++        # materialize so UninitializedParameter gets shape [1, hidden], not [hidden].
+         if (
+             is_gguf_weight
+-            and param.dim() == loaded_weight.dim() + 1
+-            and param.size(0) == 1
+-            and param.shape[1:] == loaded_weight.shape
++            and self.output_size == 1
++            and loaded_weight.dim() == 1
++            and loaded_weight.size(0) == self.input_size
+         ):
+             loaded_weight = loaded_weight.unsqueeze(0)
+ 
++        # Materialize GGUF UninitializedParameter
++        if is_gguf_weight and isinstance(param, UninitializedParameter):
++            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
++
+         assert param.size() == loaded_weight.size(), (
+             f"Tried to load weights of size {loaded_weight.size()}"
+             f"to a parameter of size {param.size()}"
+@@ -719,16 +715,9 @@ def weight_loader(
+         if isinstance(loaded_shard_id, tuple) and (
+             is_gguf_weight or is_gguf_weight_type
+         ):
+-            # GGUF can pack what the framework loads as separate slots into
+-            # a single on-disk tensor (we hit this with Qwen3.5 GDN's
+-            # attn_qkv carrying Q/K/V together). The fused tensor already
+-            # concatenates the listed slots, so split it along output_dim
+-            # by per-slot output_sizes and recurse with single-int ids.
+-            # That way the rest of the GGUF path (data_container,
+-            # shard_id_map, dequant) sees ordinary per-slot shards.
++            # GGUF can fuse multiple framework slots into one on-disk tensor.
++            # Split along output_dim by per-slot sizes and recurse.
+             if is_gguf_weight_type:
+-                # One weight-type scalar covers every slot of the fused
+-                # tensor; just recurse with the same scalar per slot.
+                 for slot in loaded_shard_id:
+                     self.weight_loader(param, loaded_weight, slot)
+                 return
+@@ -742,16 +731,6 @@ def weight_loader(
+                 f"{loaded_weight.size(output_dim)} but slots "
+                 f"{loaded_shard_id} sum to {sum(slot_sizes)}."
+             )
+-            # Each slot is independently TP-sharded by the recursive call's
+-            # is_gguf_weight branch, so its size has to be divisible by
+-            # tp_size. Catching it here gives a clear message instead of a
+-            # silent narrow() truncation later.
+-            if self.tp_size > 1:
+-                for slot, size in zip(loaded_shard_id, slot_sizes):
+-                    assert size % self.tp_size == 0, (
+-                        f"GGUF fused slot {slot} has output size {size} "
+-                        f"which is not divisible by tp_size {self.tp_size}."
+-                    )
+             offset = 0
+             for slot, size in zip(loaded_shard_id, slot_sizes):
+                 slice_ = loaded_weight.narrow(output_dim, offset, size)
