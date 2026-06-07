@@ -34,7 +34,9 @@ ExecStart=/usr/bin/docker run \
   --enforce-eager --trust-remote-code \
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":2}"
 ExecStop=/usr/bin/docker stop vllm-qwen36-q8
-Restart=on-failure
+# VLLM can exit 0 after EngineCore dies and the API server shuts down gracefully.
+# Use always, not on-failure, so the service recovers from that case.
+Restart=always
 RestartSec=30
 TimeoutStartSec=900
 
